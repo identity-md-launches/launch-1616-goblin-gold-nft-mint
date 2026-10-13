@@ -3,16 +3,17 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {GoblinNFT} from "../src/GoblinNFT.sol";
 
+/// @dev Pre-release only (eight actors can mint at most 160 tokens, so the collection never sells out): every
+///      deposit stays in the pool, no token is ever credited, refunds forfeit nothing and claims settle nothing.
 contract NFTHandler is Test {
     GoblinNFT public nft;
     address[8] public actors;
     mapping(uint256 => address) public holder;
-    mapping(uint256 => uint256) public owed;
     uint256 public live;
     uint256 public deposited;
-    uint256 public paid;
-    uint256 public retained;
     uint256 public minted;
+    uint256 public refunded;
+    uint256 public claimCalls;
 
     constructor() {
         nft = new GoblinNFT(address(this));
@@ -41,14 +42,6 @@ contract NFTHandler is Test {
     function deposit(uint256 amount) external {
         amount = bound(amount, 1, 1 ether);
         deposited += amount;
-        if (live == 0) {
-            retained += amount;
-        } else {
-            retained += amount % live;
-            for (uint256 id = 1; id <= minted; ++id) {
-                if (holder[id] != address(0)) owed[id] += amount / live;
-            }
-        }
         nft.depositRevenue{value: amount}();
     }
 
@@ -57,27 +50,29 @@ contract NFTHandler is Test {
         uint256 id = bound(rawId, 1, minted);
         address who = holder[id];
         if (who == address(0)) return;
-        retained += owed[id];
-        owed[id] = 0;
         holder[id] = address(0);
         --live;
+        ++refunded;
+        uint256 before = who.balance;
         vm.prank(who);
         nft.refund(id);
+        // Full price, nothing more: a refundable token never carries revenue out.
+        assertEq(who.balance - before, 0.001 ether);
     }
 
     function claim(uint256 rawId) external {
         if (minted == 0) return;
         uint256 id = bound(rawId, 1, minted);
         address who = holder[id];
-        if (who == address(0) || owed[id] == 0) return;
-        uint256 expected = owed[id];
-        owed[id] = 0;
-        paid += expected;
+        if (who == address(0)) return;
+        ++claimCalls;
         uint256[] memory ids = new uint256[](2);
         ids[0] = id;
         ids[1] = id;
+        uint256 before = who.balance;
         vm.prank(who);
-        assertEq(nft.claimRevenue(ids), expected);
+        assertEq(nft.claimRevenue(ids), 0);
+        assertEq(who.balance, before);
     }
 
     function transfer(uint256 rawId, uint256 recipient) external {
@@ -113,18 +108,31 @@ contract GoblinNFTInvariantTest is Test {
     }
 
     function invariant_revenueAndRefundBackingMatchIndependentLedger() public view {
-        assertEq(nft.liveSupply(), handler.live());
-        assertEq(nft.totalRevenueDeposited(), handler.deposited());
-        assertEq(nft.totalRevenueClaimed(), handler.paid());
-        assertEq(nft.retainedRevenue(), handler.retained());
+        assertFalse(nft.released());
+        uint256 live = handler.live();
+        uint256 deposited = handler.deposited();
+        assertEq(nft.liveSupply(), live);
+        assertEq(nft.totalRevenueDeposited(), deposited);
+        // Before release nothing is credited, claimed or retained: the whole deposit is the pool.
+        assertEq(nft.deferredRevenue(), deposited);
+        assertEq(nft.totalRevenueClaimed(), 0);
+        assertEq(nft.retainedRevenue(), 0);
+        assertEq(nft.revenuePerToken(), 0);
+        uint256 share = live == 0 ? 0 : deposited / live;
         uint256 pending;
         for (uint256 id = 1; id <= handler.minted(); ++id) {
-            assertEq(nft.pendingRevenue(id), handler.owed(id));
-            pending += handler.owed(id);
-            if (handler.holder(id) != address(0)) assertEq(nft.ownerOf(id), handler.holder(id));
+            if (handler.holder(id) != address(0)) {
+                assertEq(nft.ownerOf(id), handler.holder(id));
+                assertEq(nft.pendingRevenue(id), share);
+                pending += share;
+            } else {
+                assertEq(nft.pendingRevenue(id), 0);
+            }
         }
-        assertEq(pending + handler.retained() + handler.paid(), handler.deposited());
-        assertEq(address(nft).balance, handler.live() * 0.001 ether + pending + handler.retained());
+        // Provisional shares differ from the pool only by the division dust; with nobody live, nothing is shown.
+        assertEq(pending, live == 0 ? 0 : share * live);
+        if (live > 0) assertGt(pending + live, deposited);
+        assertEq(address(nft).balance, live * 0.001 ether + deposited);
         for (uint256 i; i < 8; ++i) {
             assertLe(nft.mintedBy(handler.actors(i)), 20);
         }

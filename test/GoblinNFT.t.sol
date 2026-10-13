@@ -34,6 +34,17 @@ contract GoblinNFTTest is Test {
         }
     }
 
+    /// @dev Sells out, names the three receivers and releases after the 7-day review. Refunds are then closed for
+    ///      good and revenue accrues to live tokens immediately.
+    function _sellOutAndRelease() internal {
+        _sellOut();
+        vm.prank(owner);
+        nft.setLaunchTargets(pol, reserve, vrf);
+        vm.warp(vm.getBlockTimestamp() + 7 days);
+        nft.release();
+        assertTrue(nft.released());
+    }
+
     function testMintAndLimits() public {
         vm.prank(alice);
         nft.mint{value: 0.003 ether}(3);
@@ -182,10 +193,16 @@ contract GoblinNFTTest is Test {
     function testRevenue() public {
         _sellOut();
         nft.depositRevenue{value: 1 ether}();
+        // Pre-release revenue is pooled, not credited, until release() closes refunds for good.
+        assertEq(nft.deferredRevenue(), 1 ether);
+        assertEq(nft.revenuePerToken(), 0);
+        assertEq(nft.pendingRevenue(1), 0.0001 ether);
         vm.prank(owner);
         nft.setLaunchTargets(pol, reserve, vrf);
         vm.warp(vm.getBlockTimestamp() + 7 days);
         nft.release();
+        assertEq(nft.deferredRevenue(), 0);
+        assertEq(nft.revenuePerToken(), 0.0001 ether);
         vm.deal(address(this), 10 ether);
         nft.depositRevenue{value: 10 ether}();
         uint256[] memory ids = new uint256[](1);

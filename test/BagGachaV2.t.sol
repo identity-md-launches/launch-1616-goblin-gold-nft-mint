@@ -264,15 +264,21 @@ contract EarlyGachaTest is Test {
         vm.prank(spinner);
         gacha.choose(id, true);
         gacha.flush();
+        // The holder share reaches the NFT on day one, but before release() it is pooled rather than credited:
+        // a refundable token must not be a free claim on it (GoblinNFT finding ddc7c88f / 2b4dd1f8).
+        assertEq(nft.deferredRevenue(), 0.0015 ether);
         assertEq(nft.pendingRevenue(1), 0.0015 ether);
         uint256[] memory ids = new uint256[](1);
         ids[0] = 1;
         vm.prank(spinner);
-        nft.claimRevenue(ids);
-        assertEq(address(nft).balance, 0.001 ether);
+        assertEq(nft.claimRevenue(ids), 0);
+        assertEq(address(nft).balance, 0.0025 ether);
+        uint256 beforeRefund = spinner.balance;
         vm.prank(spinner);
         nft.refund(1);
-        assertEq(address(nft).balance, 0);
+        assertEq(spinner.balance - beforeRefund, 0.001 ether);
+        assertEq(address(nft).balance, 0.0015 ether);
+        assertEq(nft.deferredRevenue(), 0.0015 ether);
         _conserved();
     }
 }

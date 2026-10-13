@@ -134,11 +134,12 @@ contract GoblinNFTLaunchTest is Test {
     }
 }
 
-/// @title Accepted audit findings, pinned as documented behaviour
-/// @notice The brief deploys commit fdb50e1 exactly and accepts the imported audit's findings without a source
-///         change. These tests reproduce them so a later reader sees the behaviour is known, not missed. If one of
-///         them ever fails, the contract's behaviour changed and ADAPTATION.md must be revisited.
-contract GoblinNFTAcceptedFindingsTest is Test {
+/// @title Reproduced audit findings: the one fixed in source, and the accepted ones pinned as documented behaviour
+/// @notice The brief deploys commit fdb50e1 with the smallest change a reproduced finding required. The fixed
+///         finding (ddc7c88f, merged from the imported audit's 2b4dd1f8) is asserted here in its reporter's own
+///         scenario; the accepted ones are reproduced so a later reader sees the behaviour is known, not missed.
+///         If a pinned test ever fails, the contract's behaviour changed and ADAPTATION.md must be revisited.
+contract GoblinNFTAuditFindingsTest is Test {
     address constant PROJECT_OWNER = 0xA7e99BB7155D7477E0C838E201b16E62B9c0b5Ac;
     GoblinNFT nft;
 
@@ -156,11 +157,10 @@ contract GoblinNFTAcceptedFindingsTest is Test {
         }
     }
 
-    /// @dev Finding 2b4dd1f1 (high, accepted by the brief): before sellout a refundable token earns a full share
-    ///      of every depositRevenue(), so a mint / deposit / claim / refund cycle keeps other holders' revenue.
-    ///      Operational consequence recorded in ADAPTATION.md: deposit revenue only once refunds are closed for
-    ///      good (after release()), or accept the dilution.
-    function testAcceptedFinding_RefundableTokensEarnRevenueBeforeSellout() public {
+    /// @dev Finding ddc7c88f (medium; imported audit 2b4dd1f8, high) — FIXED. Revenue that arrives before release()
+    ///      is pooled and credited only at release, over the tokens live then. A mint / deposit / claim / refund
+    ///      cycle therefore claims nothing and leaves the honest holders the whole deposit.
+    function testFixedFinding_RefundableMintCannotCaptureHolderRevenue() public {
         _mintFromWallets(0x1000, 5); // 100 honest tokens
         uint256 attackerFirst = _mintFromWallets(0x2000, 5); // 100 attacker tokens, 0.1 ETH in
         assertEq(nft.liveSupply(), 200);
@@ -169,6 +169,8 @@ contract GoblinNFTAcceptedFindingsTest is Test {
         vm.deal(depositor, 1 ether);
         vm.prank(depositor);
         nft.depositRevenue{value: 1 ether}();
+        assertEq(nft.deferredRevenue(), 1 ether);
+        assertEq(nft.revenuePerToken(), 0, "nothing is credited before release");
 
         uint256 attackerOut;
         for (uint256 i = 0; i < 5; ++i) {
@@ -178,22 +180,114 @@ contract GoblinNFTAcceptedFindingsTest is Test {
                 ids[j] = attackerFirst + i * 20 + j;
             }
             vm.prank(bot);
-            nft.claimRevenue(ids);
+            assertEq(nft.claimRevenue(ids), 0, "a refundable token claims nothing");
             for (uint256 j = 0; j < 20; ++j) {
                 vm.prank(bot);
                 nft.refund(ids[j]);
             }
             attackerOut += bot.balance;
         }
-        // Actual, accepted behaviour: 0.1 ETH refunded plus half of the 1 ETH deposit.
-        assertEq(attackerOut, 0.6 ether, "accepted finding no longer reproduces");
+        assertEq(attackerOut, 0.1 ether, "the attacker leaves with exactly its mint ETH");
+        assertEq(nft.liveSupply(), 100);
         uint256 honestPending;
         for (uint256 id = 1; id <= 100; ++id) {
             honestPending += nft.pendingRevenue(id);
         }
-        assertEq(honestPending, 0.5 ether);
-        // The ledger stays exact: nothing beyond what was deposited can ever leave.
-        assertEq(address(nft).balance, 100 * nft.PRICE() + honestPending + nft.retainedRevenue());
+        assertEq(honestPending, 1 ether, "honest holders keep the whole deposit");
+        assertEq(nft.retainedRevenue(), 0);
+        assertEq(address(nft).balance, 100 * nft.PRICE() + nft.deferredRevenue());
+    }
+
+    /// @dev Finding 4d6edfe8 (info) — resolved by the same change: refund() can no longer forfeit revenue, since
+    ///      nothing is credited to a token while it is refundable. The burned token's provisional share stays in
+    ///      the pool for the remaining holders.
+    function testFixedFinding_RefundForfeitsNoRevenue() public {
+        vm.pauseGasMetering();
+        _mintFromWallets(0x10000, 500);
+        vm.resumeGasMetering();
+        assertTrue(nft.soldOut());
+        vm.deal(address(this), 11 ether);
+        nft.depositRevenue{value: 10 ether}();
+        assertEq(nft.pendingRevenue(1), 0.001 ether);
+        address pol = address(new LaunchReleaseReceiver());
+        vm.prank(PROJECT_OWNER);
+        nft.setLaunchTargets(pol, pol, pol);
+        address holder = nft.ownerOf(1);
+        uint256 before = holder.balance;
+        vm.prank(holder);
+        nft.refund(1);
+        assertEq(holder.balance - before, nft.PRICE());
+        assertEq(nft.retainedRevenue(), 0, "nothing forfeited");
+        assertEq(nft.deferredRevenue(), 10 ether, "the pool is untouched");
+        assertEq(nft.pendingRevenue(1), 0);
+        uint256 pool = 10 ether;
+        assertEq(nft.pendingRevenue(2), pool / 9_999, "remaining holders share the pool");
+        vm.warp(block.timestamp + 7 days);
+        nft.release();
+        assertEq(nft.revenuePerToken(), pool / 9_999);
+        assertEq(nft.retainedRevenue(), pool % 9_999);
+        // After release, deposits accrue at once and refunds are closed for good.
+        nft.depositRevenue{value: 9_999 * 2 wei}();
+        assertEq(nft.pendingRevenue(2), pool / 9_999 + 2);
+        vm.prank(nft.ownerOf(2));
+        vm.expectRevert(GoblinNFT.RefundsClosed.selector);
+        nft.refund(2);
+    }
+
+    /// @dev Finding 8d38acb2 (low, accepted): sellout flips only inside mint(), and a refund front-running the
+    ///      selling-out mint keeps liveSupply below 10,000. Liveness only: every holder stays refundable at full
+    ///      price and nothing is lost; the honest minters of the last tokens should submit via a private relay.
+    function testAcceptedFinding_RefundCanDeferSellout() public {
+        vm.pauseGasMetering();
+        _mintFromWallets(0x10000, 499); // 9,980 live; the griefer at 0x10000 holds ids 1..20
+        vm.resumeGasMetering();
+        address griefer = address(uint160(0x10000));
+        address honest = makeAddr("honest");
+        vm.deal(honest, 0.02 ether);
+        vm.prank(griefer);
+        nft.refund(1); // front-runs the selling-out mint
+        vm.prank(honest);
+        nft.mint{value: 0.02 ether}(20);
+        assertEq(nft.liveSupply(), 9_999);
+        assertFalse(nft.soldOut());
+        vm.expectRevert(GoblinNFT.NotSoldOut.selector);
+        nft.release();
+        assertEq(griefer.balance, nft.PRICE());
+        assertTrue(nft.refundsOpen(), "nobody is locked in while sellout is deferred");
+    }
+
+    /// @dev Finding b0ebc1e8 (info, accepted): an EIP-7702 delegated EOA carries 23 bytes of code, so the code-size
+    ///      check in setLaunchTargets accepts it. The check proves only that a destination has code, not that it is
+    ///      safe or immutable; the 7-day refund review is the real protection and README says so.
+    function testAcceptedFinding_DelegatedEoaPassesTheCodeSizeCheck() public {
+        address eoa = makeAddr("delegated-eoa");
+        vm.etch(eoa, abi.encodePacked(hex"ef0100", address(new LaunchReleaseReceiver())));
+        assertEq(eoa.code.length, 23);
+        vm.prank(PROJECT_OWNER);
+        nft.setLaunchTargets(eoa, eoa, eoa);
+        assertEq(nft.polTarget(), eoa);
+        assertTrue(nft.refundsOpen(), "the review window opens on every target change");
+    }
+
+    /// @dev Finding 9c24d1d4 (info, accepted by the brief's "each call restarts the 7-day review"): an owner that
+    ///      re-sets targets at least every 7 days keeps release() unreachable. Refunds stay open the whole time, so
+    ///      the only effect is that the split waits for the owner to stop; no ETH is locked.
+    function testAcceptedFinding_OwnerCanRestartTheReviewIndefinitely() public {
+        vm.pauseGasMetering();
+        _mintFromWallets(0x10000, 500);
+        vm.resumeGasMetering();
+        address pol = address(new LaunchReleaseReceiver());
+        for (uint256 i = 0; i < 20; ++i) {
+            vm.prank(PROJECT_OWNER);
+            nft.setLaunchTargets(pol, pol, pol);
+            vm.warp(block.timestamp + 6 days);
+            vm.expectRevert(GoblinNFT.ReviewPending.selector);
+            nft.release();
+            assertTrue(nft.refundsOpen());
+        }
+        vm.warp(block.timestamp + 1 days);
+        nft.release();
+        assertTrue(nft.released());
     }
 
     /// @dev Finding 3e4002dd (low, accepted): refunds reopen during a post-sellout review after reveal(), so a

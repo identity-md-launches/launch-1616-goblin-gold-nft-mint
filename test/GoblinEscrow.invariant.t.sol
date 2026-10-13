@@ -22,6 +22,7 @@ contract EscrowHandler is Test {
     uint256 public paid;
     uint256 public retained;
     uint256 public accumulator;
+    uint256 public deferred;
     bool public released;
     address public pol;
     address public reserve;
@@ -65,7 +66,8 @@ contract EscrowHandler is Test {
         }
         burned[id] = true;
         --live;
-        retained += accumulator - revenueClaimedAt[id];
+        // Before release nothing has accrued (accumulator is 0), so a refund forfeits no revenue.
+        assertEq(accumulator, 0);
         uint256 beforeBalance = holder.balance;
         vm.prank(holder);
         nft.refund(id);
@@ -75,7 +77,9 @@ contract EscrowHandler is Test {
     function deposit(uint256 amount) external {
         amount = bound(amount, 1, 1 ether);
         deposits += amount;
-        if (live == 0) {
+        if (!released) {
+            deferred += amount;
+        } else if (live == 0) {
             retained += amount;
         } else {
             accumulator += amount / live;
@@ -104,6 +108,14 @@ contract EscrowHandler is Test {
         owed[pol] += amount / 2;
         owed[reserve] += amount * 40 / 100;
         owed[vrf] += amount - amount / 2 - amount * 40 / 100;
+        // The pre-release pool is split over the tokens live at release; the remainder is retained.
+        if (live == 0) {
+            retained += deferred;
+        } else {
+            accumulator += deferred / live;
+            retained += deferred % live;
+        }
+        deferred = 0;
         nft.release();
     }
 
@@ -152,6 +164,9 @@ contract GoblinEscrowInvariantTest is Test {
         assertEq(nft.totalRevenueClaimed(), h.paid());
         assertEq(nft.retainedRevenue(), h.retained());
         assertEq(nft.revenuePerToken(), h.accumulator());
+        assertEq(nft.deferredRevenue(), h.deferred());
+        if (!h.released()) assertEq(h.accumulator(), 0);
+        else assertEq(h.deferred(), 0);
         uint256 escrow;
         for (uint256 i; i < 3; ++i) {
             address target = address(h.targets(i));

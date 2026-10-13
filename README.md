@@ -38,17 +38,23 @@ skip on the default local chain; see `report.md` for attempted network checks an
 | Release | 50% POL / 40% reserve / 10% VRF, using only `liveSupply * PRICE` |
 
 Before sellout, refunding frees supply capacity, with new mints receiving new IDs. At the first
-sellout, minting closes permanently, even if later refunds reduce live supply. Refunds normally
-close at sellout. **Minters/current holders can always exit with their full mint ETH during any
+sellout, minting closes permanently, even if later refunds reduce live supply. Sellout flips only
+inside `mint()` when live supply reaches 10,000, so a refund that lands just before the
+selling-out mint keeps the collection unsold and `release()` unreachable until the gap is minted
+again; this costs the refunder only gas and locks nobody in (refunds stay open), but the minters
+of the last tokens should submit through a private relay. Refunds normally close at sellout. **Minters/current holders can always exit with their full mint ETH during any
 7-day target review**, including reviews after sellout. Selling the NFT transfers that right to
 the buyer. After 90 days from sellout, refunds also reopen until release. At the exact review end,
 release becomes possible; at the exact 90-day boundary, the fallback refund becomes possible.
 Once released, mint refunds close permanently.
 
 The owner can call `setLaunchTargets(pol, reserve, vrf)` only before release. Every address must
-have deployed code. Every call, even with unchanged targets, restarts a full seven-day review.
-The code-size check proves a destination is a contract, not that its behavior is safe: holders
-must inspect all three destinations during review. Shared destinations are supported; they pull
+have deployed code. Every call, even with unchanged targets, restarts a full seven-day review, so
+an owner that keeps re-setting targets defers `release()` for as long as it keeps doing so; refunds
+stay open throughout, so no ETH is locked by that. The code-size check proves only that a
+destination has code: an upgradeable proxy or an EIP-7702 delegated EOA (23 bytes of code) passes
+it and can change behaviour after the review. Holders must inspect all three destinations during
+review and refund if they do not trust them. Shared destinations are supported; they pull
 the sum of their shares. The owner can transfer ownership, and can `renounceOwnership()` **only
 after release**. The owner has no withdrawal, pause, mint-rescue, metadata-setting or upgrade power.
 
@@ -58,26 +64,37 @@ The constructor takes one address, calls no external contract and requires no ex
 `script/DeployGoblinNFT.s.sol` is a local reference helper, with an explicit owner argument and no
 broadcast call. Do not use a factory's `msg.sender` as the owner.
 
-### Revenue from day one
+### Revenue from day one, claimable from release
 
 `depositRevenue()` accepts positive ETH at any time, including before the first mint and before
-sellout. The accumulator is **whole wei per live token**. On each deposit of `D` with `N > 0`
-live tokens, every live token earns `D / N`, and `D % N` is added to `retainedRevenue`. A new mint
-starts with `revenuePaid[id] = revenuePerToken`, so it receives none of a previous deposit.
+sellout. Until `release()`, every token is refundable at full price (before sellout, during every
+review and from 90 days after sellout), so a token must not earn a share of revenue while its
+mint is still refundable: otherwise a mint / deposit / claim / refund cycle would take other
+holders' revenue at no cost. Therefore:
+
+- **Before release** every deposit goes into `deferredRevenue`. No token is credited and nothing
+  is claimable; `claimRevenue()` settles nothing and returns 0 (it does not revert), and
+  `pendingRevenue(id)` shows the token's provisional share `deferredRevenue / liveSupply`, which
+  is recomputed over whichever tokens are live. A refund burns the NFT, pays exactly 0.001 ETH and
+  **forfeits nothing**; the burned token's provisional share stays in the pool for the others.
+- **At release** the pool is split in whole wei over the tokens live at that moment:
+  `revenuePerToken += deferredRevenue / liveSupply`, the remainder goes to `retainedRevenue`, and
+  `DeferredRevenueDistributed` is emitted. If nobody is live at release the pool is retained.
+- **After release** (refunds are closed for good) each deposit of `D` with `N > 0` live tokens
+  credits every live token `D / N` at once and retains `D % N`. Deposits at zero live supply are
+  retained.
 
 Claims belong to the current token owner. Unclaimed revenue travels with transfers; duplicate
-IDs in one claim cannot pay twice. A refund burns the NFT and moves **all its unclaimed revenue**
-to `retainedRevenue`, emitting `RevenueRetained`. Claim revenue first to avoid forfeiting it.
-Deposits at zero live supply are entirely retained. Retained revenue stays in the NFT forever:
-there is no sweep and no gift of old deposits to future minters. This explicit whole-wei policy
-keeps accounting exact, with less than `liveSupply` wei of dust per nonempty-supply deposit.
+IDs in one claim cannot pay twice; after release `claimRevenue()` reverts `NothingOwed` when
+nothing is claimable. Retained revenue stays in the NFT forever: there is no sweep and no owner
+withdrawal. This explicit whole-wei policy keeps accounting exact.
 
 Ignoring unsolicited forced ETH, these identities hold:
 
 ```text
-unclaimed live-token revenue + retainedRevenue
+unclaimed credited revenue + deferredRevenue + retainedRevenue
     = totalRevenueDeposited - totalRevenueClaimed
-NFT ETH before release = liveSupply * PRICE + unclaimed revenue + retainedRevenue
+NFT ETH before release = liveSupply * PRICE + deferredRevenue            (nothing credited yet)
 NFT ETH after release  = polOwed + reserveOwed + vrfOwed + unclaimed revenue + retainedRevenue
 ```
 
