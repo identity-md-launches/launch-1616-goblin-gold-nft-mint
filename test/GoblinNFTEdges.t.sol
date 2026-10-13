@@ -43,6 +43,11 @@ contract ReentrantHolder {
         nft.claimRevenue(ids);
     }
 
+    function refundSelf(uint256 id) external {
+        targetId = id;
+        nft.refund(id);
+    }
+
     receive() external payable {
         if (attempts > 0) return;
         attempts++;
@@ -328,11 +333,51 @@ contract GoblinNFTEdgesTest is Test {
 
     // ------------------------------------------------------------ revenue failure paths
 
-    function testRevenueGuards() public {
+    function _release() internal {
+        if (!nft.soldOut()) _sellOut();
+        _setTargets();
+        vm.warp(block.timestamp + 7 days);
+        nft.release();
+    }
+
+    function testRevenueGuardsBeforeRelease() public {
         vm.expectRevert(GoblinNFT.WrongPayment.selector);
         nft.depositRevenue{value: 0}();
 
         _mintAs(alice, 2);
+        uint256[] memory none = new uint256[](0);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = 1;
+        nft.depositRevenue{value: 1 ether}();
+        assertEq(nft.deferredRevenue(), 1 ether);
+        assertEq(nft.revenuePerToken(), 0, "nothing accrues to a refundable token");
+        assertEq(nft.pendingRevenue(1), 0.5 ether, "provisional share is shown");
+
+        // Before release a claim settles nothing and pays nothing, but a foreign id still reverts.
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        assertEq(nft.claimRevenue(none), 0);
+        vm.prank(alice);
+        assertEq(nft.claimRevenue(ids), 0);
+        assertEq(alice.balance, before);
+        assertEq(nft.totalRevenueClaimed(), 0);
+        vm.prank(bob);
+        vm.expectRevert(GoblinNFT.NotHolder.selector);
+        nft.claimRevenue(ids);
+
+        // A refund forfeits nothing: the pool stays whole for the remaining holders.
+        vm.prank(alice);
+        nft.refund(2);
+        assertEq(nft.deferredRevenue(), 1 ether);
+        assertEq(nft.retainedRevenue(), 0);
+        assertEq(nft.pendingRevenue(1), 1 ether);
+        assertEq(nft.pendingRevenue(2), 0);
+    }
+
+    function testRevenueGuardsAfterRelease() public {
+        _mintAs(alice, 2);
+        _mintAs(bob, 1);
+        _release();
         uint256[] memory none = new uint256[](0);
         vm.prank(alice);
         vm.expectRevert(GoblinNFT.NothingOwed.selector);
@@ -344,13 +389,12 @@ contract GoblinNFTEdgesTest is Test {
         vm.expectRevert(GoblinNFT.NothingOwed.selector);
         nft.claimRevenue(ids);
 
-        nft.depositRevenue{value: 1 ether}();
+        nft.depositRevenue{value: 10 ether}(); // 0.001 ether per token
         vm.prank(bob);
         vm.expectRevert(GoblinNFT.NotHolder.selector);
         nft.claimRevenue(ids);
 
         // One foreign id in the batch reverts the whole batch.
-        _mintAs(bob, 1);
         uint256[] memory mixed = new uint256[](2);
         mixed[0] = 1;
         mixed[1] = 3;
@@ -359,23 +403,30 @@ contract GoblinNFTEdgesTest is Test {
         nft.claimRevenue(mixed);
 
         vm.prank(alice);
-        assertEq(nft.claimRevenue(ids), 0.5 ether);
+        assertEq(nft.claimRevenue(ids), 0.001 ether);
         vm.prank(alice);
         vm.expectRevert(GoblinNFT.NothingOwed.selector);
         nft.claimRevenue(ids);
-        assertEq(nft.pendingRevenue(99), 0);
+        assertEq(nft.pendingRevenue(10_001), 0);
     }
 
     function testDepositSmallerThanSupplyIsAllRetained() public {
         _mintAs(alice, 3);
-        nft.depositRevenue{value: 2}();
+        nft.depositRevenue{value: 2}(); // deferred until release
+        assertEq(nft.retainedRevenue(), 0);
+        _release();
+        assertEq(nft.deferredRevenue(), 0);
         assertEq(nft.revenuePerToken(), 0);
-        assertEq(nft.retainedRevenue(), 2);
+        assertEq(nft.retainedRevenue(), 2, "pool smaller than supply is retained at release");
+        nft.depositRevenue{value: 9_999}();
+        assertEq(nft.revenuePerToken(), 0);
+        assertEq(nft.retainedRevenue(), 10_001);
     }
 
     function testRevenueFollowsTokenAcrossTransferAndRevertsForRejectingHolder() public {
         _mintAs(alice, 1);
-        nft.depositRevenue{value: 1 ether}();
+        nft.depositRevenue{value: 10 ether}(); // pre-release pool, 0.001 ether per token at release
+        _release();
         vm.prank(alice);
         nft.transferFrom(alice, bob, 1);
         uint256[] memory ids = new uint256[](1);
@@ -386,29 +437,44 @@ contract GoblinNFTEdgesTest is Test {
         uint256 before = bob.balance;
         vm.prank(bob);
         nft.claimRevenue(ids);
-        assertEq(bob.balance - before, 1 ether);
+        assertEq(bob.balance - before, 0.001 ether);
 
         EdgeTarget rejecting = new EdgeTarget();
         rejecting.setReject(true);
         vm.prank(bob);
         nft.transferFrom(bob, address(rejecting), 1);
-        nft.depositRevenue{value: 1 ether}();
+        nft.depositRevenue{value: 10 ether}();
         vm.prank(address(rejecting));
         vm.expectRevert(GoblinNFT.TransferFailed.selector);
         nft.claimRevenue(ids);
-        assertEq(nft.pendingRevenue(1), 1 ether, "failed claim keeps the revenue");
+        assertEq(nft.pendingRevenue(1), 0.001 ether, "failed claim keeps the revenue");
     }
 
-    function testReentrantHolderGainsNothing() public {
+    function testReentrantHolderGainsNothingOnRefund() public {
+        ReentrantHolder h = new ReentrantHolder(nft);
+        vm.deal(address(h), 1 ether);
+        h.mint{value: 0.002 ether}(2);
+        nft.depositRevenue{value: 1 ether}();
+        uint256 before = address(h).balance;
+        h.refundSelf(1);
+        assertEq(h.attempts(), 1);
+        assertEq(h.successes(), 0, "claim and refund re-entry both blocked");
+        assertEq(address(h).balance - before, 0.001 ether);
+        assertEq(nft.liveSupply(), 1);
+        assertEq(nft.deferredRevenue(), 1 ether);
+    }
+
+    function testReentrantHolderGainsNothingOnClaim() public {
         ReentrantHolder h = new ReentrantHolder(nft);
         vm.deal(address(h), 1 ether);
         h.mint{value: 0.001 ether}(1);
-        nft.depositRevenue{value: 1 ether}();
+        nft.depositRevenue{value: 10 ether}();
+        _release();
         uint256 before = address(h).balance;
         h.claim(1);
         assertEq(h.attempts(), 1);
         assertEq(h.successes(), 0);
-        assertEq(address(h).balance - before, 1 ether);
+        assertEq(address(h).balance - before, 0.001 ether);
         assertEq(nft.ownerOf(1), address(h));
     }
 
@@ -458,18 +524,53 @@ contract GoblinNFTEdgesTest is Test {
         nft.release(); // same block as sellout
         assertTrue(nft.released());
     }
+}
 
-    // ------------------------------------------------------------ fuzz: split and revenue arithmetic
+/// @dev Starts every fuzz run from a sold-out collection with targets under review, so release-time
+///      revenue arithmetic can be fuzzed without re-minting 10,000 tokens per run.
+contract GoblinNFTRevenueFuzzTest is Test {
+    address constant OWNER = 0xA7e99BB7155D7477E0C838E201b16E62B9c0b5Ac;
+    GoblinNFT nft;
+
+    function setUp() public {
+        nft = new GoblinNFT(OWNER);
+        for (uint256 i; i < 500; ++i) {
+            address m = address(uint160(0xB0000 + i));
+            vm.deal(m, 1 ether);
+            vm.prank(m);
+            nft.mint{value: 0.02 ether}(20);
+        }
+        EdgeTarget t = new EdgeTarget();
+        vm.prank(OWNER);
+        nft.setLaunchTargets(address(t), address(t), address(t));
+    }
 
     /// forge-config: default.fuzz.runs = 1000
-    function testFuzzRevenueSplitIsExact(uint256 holders, uint256 amount) public {
-        holders = bound(holders, 1, 20);
-        amount = bound(amount, 1, 1_000_000 ether);
-        _mintAs(alice, holders);
-        vm.deal(address(this), amount);
-        nft.depositRevenue{value: amount}();
-        assertEq(nft.revenuePerToken() * holders + nft.retainedRevenue(), amount);
-        assertLt(nft.retainedRevenue(), holders);
+    function testFuzzDeferredAndLiveRevenueSplitIsExact(uint256 refunds, uint256 pre, uint256 post) public {
+        refunds = bound(refunds, 0, 20);
+        pre = bound(pre, 1, 1_000_000 ether);
+        post = bound(post, 1, 1_000_000 ether);
+        address first = address(uint160(0xB0000)); // holds ids 1..20
+        for (uint256 id = 1; id <= refunds; ++id) {
+            vm.prank(first);
+            nft.refund(id);
+        }
+        uint256 supply = 10_000 - refunds;
+        vm.deal(address(this), pre + post);
+        nft.depositRevenue{value: pre}();
+        assertEq(nft.pendingRevenue(10_000), pre / supply);
+        vm.warp(block.timestamp + 7 days);
+        nft.release();
+        assertEq(nft.deferredRevenue(), 0);
+        assertEq(nft.revenuePerToken() * supply + nft.retainedRevenue(), pre);
+        assertLt(nft.retainedRevenue(), supply);
+        assertEq(nft.pendingRevenue(10_000), pre / supply);
+        assertEq(nft.pendingRevenue(1), refunds > 0 ? 0 : pre / supply);
+
+        nft.depositRevenue{value: post}();
+        assertEq(nft.revenuePerToken() * supply + nft.retainedRevenue(), pre + post);
+        assertLt(nft.retainedRevenue(), 2 * supply);
+        assertEq(address(nft).balance, supply * 0.001 ether + pre + post);
     }
 }
 
@@ -531,7 +632,12 @@ contract LifecycleHandler is Test {
         for (uint256 i; i < q; ++i) {
             liveIds.push(first + i);
             slot[first + i] = liveIds.length;
-            assertEq(nft.pendingRevenue(first + i), 0, "new mints get no earlier revenue");
+            assertEq(nft.revenuePaid(first + i), acc, "new mints settle at the current accumulator");
+            assertEq(
+                nft.pendingRevenue(first + i),
+                nft.deferredRevenue() / nft.liveSupply(),
+                "a new mint only shows its provisional share of the pre-release pool"
+            );
         }
         ghostPaidLive += acc * q;
         ghostMinted += q;
@@ -581,12 +687,13 @@ contract LifecycleHandler is Test {
         }
         uint256 paidBefore = nft.revenuePaid(id);
         uint256 retainedBefore = nft.retainedRevenue();
-        uint256 pending = nft.pendingRevenue(id);
+        uint256 deferredBefore = nft.deferredRevenue();
         uint256 before = holder.balance;
         vm.prank(holder);
         nft.refund(id);
-        assertEq(holder.balance - before, 0.001 ether);
-        assertEq(nft.retainedRevenue() - retainedBefore, pending, "refunded token's revenue is retained");
+        assertEq(holder.balance - before, 0.001 ether, "refund pays exactly the price");
+        assertEq(nft.retainedRevenue(), retainedBefore, "refund forfeits nothing to retained");
+        assertEq(nft.deferredRevenue(), deferredBefore, "refund leaves the pool to the remaining holders");
         ghostPaidLive -= paidBefore;
         _remove(id);
         ghostRefunded++;
@@ -622,9 +729,16 @@ contract LifecycleHandler is Test {
         uint256 paid = nft.revenuePaid(id);
         uint256 expected = acc - paid;
         if (expected == 0) {
-            vm.prank(who);
-            vm.expectRevert(GoblinNFT.NothingOwed.selector);
-            nft.claimRevenue(ids);
+            if (nft.released()) {
+                vm.prank(who);
+                vm.expectRevert(GoblinNFT.NothingOwed.selector);
+                nft.claimRevenue(ids);
+            } else {
+                uint256 bal = who.balance;
+                vm.prank(who);
+                assertEq(nft.claimRevenue(ids), 0, "nothing is claimable before release");
+                assertEq(who.balance, bal);
+            }
             return;
         }
         uint256 before = who.balance;
@@ -674,8 +788,17 @@ contract LifecycleHandler is Test {
             return;
         }
         releasedAmount = nft.liveSupply() * 0.001 ether;
+        uint256 pool = nft.deferredRevenue();
+        uint256 accBefore = nft.revenuePerToken();
+        uint256 retainedBefore = nft.retainedRevenue();
         nft.release();
         everReleased = true;
+        assertEq(nft.deferredRevenue(), 0, "release empties the pool");
+        assertEq(
+            (nft.revenuePerToken() - accBefore) * nft.liveSupply() + nft.retainedRevenue() - retainedBefore,
+            pool,
+            "the pool is split over live tokens with only dust retained"
+        );
     }
 
     function pull(uint256 i) external {
@@ -732,6 +855,7 @@ contract GoblinNFTLifecycleInvariantTest is Test {
         assertEq(
             address(nft).balance,
             escrow + nft.revenuePerToken() * nft.liveSupply() - h.ghostPaidLive() + nft.retainedRevenue()
+                + nft.deferredRevenue()
         );
     }
 
@@ -758,8 +882,14 @@ contract GoblinNFTLifecycleInvariantTest is Test {
             assertTrue(nft.soldOut());
             assertLe(h.ghostReleasePulled(), h.releasedAmount());
             assertEq(nft.polOwed() + nft.reserveOwed() + nft.vrfOwed() + h.ghostReleasePulled(), h.releasedAmount());
+            assertEq(nft.deferredRevenue(), 0);
         } else {
             assertEq(nft.polOwed() + nft.reserveOwed() + nft.vrfOwed(), 0);
+            // Before release nothing accrues to a refundable token and nothing has been paid out as revenue.
+            assertEq(nft.revenuePerToken(), 0);
+            assertEq(nft.retainedRevenue(), 0);
+            assertEq(nft.totalRevenueClaimed(), 0);
+            assertEq(nft.deferredRevenue(), nft.totalRevenueDeposited());
             if (!nft.soldOut()) assertTrue(nft.refundsOpen());
         }
         assertEq(nft.owner(), h.owner());
